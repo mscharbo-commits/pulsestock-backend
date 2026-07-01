@@ -1,0 +1,12 @@
+{
+  "name": "pulsestock-backend",
+  "version": "1.0.0",
+  "description": "PulseStock Research backend — stop monitor, price API, pre-screener",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
