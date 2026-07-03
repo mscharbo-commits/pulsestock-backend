@@ -1,5 +1,5 @@
 // PulseStock Universe Scanner — run nightly: node scan.js
-// Uses Polygon.io (real VWAP, float, fundamentals) + Haiku AI scoring
+// Full scoring: Polygon (technicals + news) + Market/Sector context + Haiku AI ranking
 
 const https = require('https');
 const http = require('http');
@@ -34,7 +34,7 @@ function fetchJson(url, opts = {}) {
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function poly(ep) {
-  await delay(120); // ~8 calls/sec, well within Starter limits
+  await delay(120);
   return fetchJson(`https://api.polygon.io${ep}`, {
     headers: { 'Authorization': `Bearer ${POLY_KEY}` }
   });
@@ -53,7 +53,88 @@ async function sb(method, table, data, params = '') {
   });
 }
 
-// ── POLYGON DATA FETCHERS ──
+// ── MARKET CONTEXT (runs once at scan start) ──
+async function getMarketContext() {
+  console.log('[Scan] Fetching market context (SPY, VIX, sector ETFs)...');
+  
+  const [spy, vix, xlk, xlf, xle, xlv, xli, xlp, xlu, xlb, xly, xlre, xlc] = await Promise.all([
+    poly('/v2/aggs/ticker/SPY/prev'),
+    poly('/v2/aggs/ticker/VIXY/prev'), // VIX proxy ETF
+    poly('/v2/aggs/ticker/XLK/prev'),  // Tech
+    poly('/v2/aggs/ticker/XLF/prev'),  // Financials
+    poly('/v2/aggs/ticker/XLE/prev'),  // Energy
+    poly('/v2/aggs/ticker/XLV/prev'),  // Healthcare
+    poly('/v2/aggs/ticker/XLI/prev'),  // Industrials
+    poly('/v2/aggs/ticker/XLP/prev'),  // Consumer Staples
+    poly('/v2/aggs/ticker/XLU/prev'),  // Utilities
+    poly('/v2/aggs/ticker/XLB/prev'),  // Materials
+    poly('/v2/aggs/ticker/XLY/prev'),  // Consumer Discretionary
+    poly('/v2/aggs/ticker/XLRE/prev'), // Real Estate
+    poly('/v2/aggs/ticker/XLC/prev')   // Communication
+  ]);
+
+  const getReturn = (d) => {
+    const r = d?.results?.[0];
+    if (!r || !r.o) return null;
+    return ((r.c - r.o) / r.o * 100).toFixed(2);
+  };
+
+  const spyRet = getReturn(spy);
+  const vixLevel = vix?.results?.[0]?.c;
+
+  const sectorReturns = {
+    'XLK (Tech)': getReturn(xlk),
+    'XLF (Financials)': getReturn(xlf),
+    'XLE (Energy)': getReturn(xle),
+    'XLV (Healthcare)': getReturn(xlv),
+    'XLI (Industrials)': getReturn(xli),
+    'XLP (Staples)': getReturn(xlp),
+    'XLU (Utilities)': getReturn(xlu),
+    'XLB (Materials)': getReturn(xlb),
+    'XLY (Discretionary)': getReturn(xly),
+    'XLRE (Real Estate)': getReturn(xlre),
+    'XLC (Communication)': getReturn(xlc)
+  };
+
+  // Identify leading and lagging sectors
+  const sorted = Object.entries(sectorReturns)
+    .filter(([,v]) => v !== null)
+    .sort((a,b) => parseFloat(b[1]) - parseFloat(a[1]));
+
+  const leading = sorted.slice(0, 3).map(([k,v]) => `${k}:+${v}%`).join(', ');
+  const lagging = sorted.slice(-3).map(([k,v]) => `${k}:${v}%`).join(', ');
+
+  const regime = parseFloat(spyRet) > 0.3 ? 'BULL' : parseFloat(spyRet) < -0.3 ? 'BEAR' : 'NEUTRAL';
+  const vixWarning = vixLevel && vixLevel > 20 ? `HIGH VIX (${vixLevel}) — reduce position sizing, wider stops` : `Low volatility (VIX proxy: ${vixLevel || '?'})`;
+
+  const context = {
+    spyReturn: spyRet,
+    regime,
+    vixLevel,
+    vixWarning,
+    leading,
+    lagging,
+    sectorReturns,
+    summary: `Market: SPY${spyRet >= 0 ? '+' : ''}${spyRet}% (${regime}). ${vixWarning}. Leading sectors: ${leading}. Lagging: ${lagging}.`
+  };
+
+  console.log(`[Market] ${context.summary}`);
+  return context;
+}
+
+// ── NEWS FETCHER ──
+async function getTickerNews(ticker) {
+  await delay(100);
+  const today = new Date().toISOString().split('T')[0];
+  const weekAgo = new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
+  const d = await poly(`/v2/reference/news?ticker=${ticker}&published_utc.gte=${weekAgo}&limit=5&sort=published_utc&order=desc`);
+  const articles = d?.results || [];
+  if (!articles.length) return null;
+  // Return just the headlines for Haiku to analyze
+  return articles.map(a => a.title).slice(0, 5).join(' | ');
+}
+
+// ── POLYGON DATA ──
 async function getPrevDay(ticker) {
   const d = await poly(`/v2/aggs/ticker/${ticker}/prev`);
   return d?.results?.[0] || null;
@@ -69,87 +150,51 @@ async function getFinancials(ticker) {
   return d?.results || null;
 }
 
-async function getShortInterest(ticker) {
-  // Short interest from Polygon
-  const d = await poly(`/v2/reference/shorts/${ticker}`);
-  return d?.results?.[0] || null;
-}
-
-// ── SCORE CALCULATOR ──
-function calculateScores(ticker, prev, details, financials) {
-  if (!prev || !prev.c) return null;
-
-  const price = prev.c;
-  const vwap = prev.vw;
-
-  // Hard quality filters — must pass ALL of these
-  if (price < 2) return null;                          // no penny stocks
-  if (!vwap || vwap <= 0) return null;                 // must have VWAP
-  if (!prev.v || prev.v < 500000) return null;         // minimum 500K daily volume
-  if (!prev.h || !prev.l) return null;                 // must have day range
-  const dayRangePct = (prev.h - prev.l) / prev.l * 100;
-  if (dayRangePct < 0.5) return null;                  // frozen stock filter
-  if (dayRangePct > 25) return null;                   // wildly volatile/halted
-  const vwapDeviation = Math.abs(price - vwap) / vwap * 100;
-  if (vwapDeviation > 20) return null;                 // not wildly extended from VWAP
-  const high = prev.h;
-  const low = prev.l;
-  const open = prev.o;
-
-  // Need 52W data — use prev day high/low as proxy for now, get from snapshot
-  // For mechanical scoring use what we have
-  const vwapAbove = price > vwap;
-  const dayMomentum = (price - open) / open * 100; // intraday direction
-  
-  // Float and shares
-  const sharesOutstanding = details?.weighted_shares_outstanding || null;
-  const marketCap = details?.market_cap || null;
-
-  // Revenue growth from financials (last 2 quarters)
-  let revenueGrowth = null;
-  let marginTrend = null;
-  if (financials && financials.length >= 2) {
-    const q1rev = financials[0]?.financials?.income_statement?.revenues?.value;
-    const q2rev = financials[1]?.financials?.income_statement?.revenues?.value;
-    if (q1rev && q2rev && q2rev > 0) {
-      revenueGrowth = (q1rev - q2rev) / q2rev;
-    }
-    const q1ni = financials[0]?.financials?.income_statement?.net_income_loss?.value;
-    const q2ni = financials[1]?.financials?.income_statement?.net_income_loss?.value;
-    if (q1ni && q2ni && q2ni > 0) {
-      marginTrend = q1ni > q2ni ? 'expanding' : 'contracting';
-    }
-  }
-
-  return {
-    price, vwap, vwapAbove, volume: prev.v,
-    dayMomentum: parseFloat(dayMomentum.toFixed(2)),
-    marketCap, sharesOutstanding,
-    revenueGrowth: revenueGrowth ? parseFloat(revenueGrowth.toFixed(3)) : null,
-    marginTrend
-  };
-}
-
-// ── HAIKU AI BATCH SCORER ──
-async function haikuScore(batch, strategy) {
+// ── HAIKU BATCH SCORER ──
+async function haikuScore(batch, strategy, marketContext) {
   if (!ANTHROPIC_KEY || !batch.length) return {};
 
-  const stratHints = {
-    momentum: 'MOMENTUM GROWTH (10-60 day hold): Score highest for: confirmed price uptrend (HH/HL), strong relative strength vs sector, price above VWAP (institutional buying), 2+ quarters of revenue growth, RSI 45-75, regime-aligned sectors. Penalize: downtrends, China ADRs, negative revisions, broken structure.',
-    compounder: 'QUALITY COMPOUNDER (long-term): Score highest for: durable moat (network effects/switching costs/brand), positive FCF, expanding margins, ROIC > WACC, reasonable valuation, low debt. Penalize: commoditized businesses, shrinking margins, high debt, poor capital allocation.',
-    catalyst: 'CATALYST SWING (3-10 day hold): Score highest for: price above VWAP (smart money in), RSI 40-70 building momentum, fresh relative strength breakout, intact price structure, any near-term catalyst (earnings/FDA/launch/split). Penalize: already extended moves, downtrends, illiquid names.'
+  const weights = {
+    momentum:   { tech: 30, fundamental: 25, news: 25, sector: 20 },
+    compounder: { tech: 20, fundamental: 40, news: 15, sector: 25 },
+    catalyst:   { tech: 25, fundamental: 15, news: 45, sector: 15 }
+  };
+  const w = weights[strategy];
+
+  const stratRules = {
+    momentum: `MOMENTUM GROWTH RULES:
+- TECHNICALS (${w.tech}%): Price structure HH/HL is paramount. VWAP above = institutional buying. RSI 45-75 building not exhausted. Relative strength vs sector ETF positive. PENALIZE heavily: downtrends, broken structure, RSI>80 exhausted.
+- FUNDAMENTALS (${w.fundamental}%): Must show 2+ consecutive quarters of revenue growth. Positive EPS trend. Reasonable valuation. PENALIZE: negative revenue growth, earnings misses, China-domiciled companies (score 0-10 max).
+- NEWS (${w.news}%): Score HIGH for: earnings beats, guidance raises, analyst upgrades, product launches, major contract wins. Score LOW for: general market commentary, price target reiterations with no change, irrelevant mentions. Score NEAR ZERO for: earnings misses, guidance cuts, lawsuits, SEC investigations, CEO departure.
+- SECTOR (${w.sector}%): Heavily favor sectors currently leading the market. PENALIZE sectors with negative momentum. ${marketContext.summary}`,
+
+    compounder: `QUALITY COMPOUNDER RULES:
+- TECHNICALS (${w.tech}%): Technical setup confirms entry timing only. Not overbought (RSI<76). Not in downtrend. Near VWAP (not extended). 
+- FUNDAMENTALS (${w.fundamental}%): Durable moat required (network effects/switching costs/brand/patents). Positive FCF. Expanding margins. ROIC>WACC. Low debt. Score utilities (XLU) and REITs lower as they lack growth moats. Score 0-10 for commoditized businesses.
+- NEWS (${w.news}%): Use primarily as RED FLAG DETECTOR. Score VERY LOW for: guidance cuts, margin compression, key management departure, competitive threat news, regulatory issues. Score neutral (50) for no meaningful news. Score higher for moat-strengthening news (new patent, contract, partnership).
+- SECTOR (${w.sector}%): Favor sectors with durable long-term tailwinds (tech, healthcare, financials with moats). ${marketContext.summary}`,
+
+    catalyst: `CATALYST SWING RULES:
+- TECHNICALS (${w.tech}%): VWAP above is the PRIMARY gate — if below VWAP score 0-15 max. RSI 40-70 with building momentum. Fresh relative strength breakout. Crowd not yet fully positioned. PENALIZE: already extended 15%+ from VWAP, utilities (wrong sector for catalyst swing), downtrends.
+- FUNDAMENTALS (${w.fundamental}%): Only context for the 3-10 day hold. Positive business trajectory helps but is secondary. 
+- NEWS (${w.news}%): THIS IS THE MOST IMPORTANT DIMENSION FOR CATALYST SWING. Score VERY HIGH (80-95) for: confirmed earnings date within 10 days, FDA decision pending, confirmed product launch, stock split effective, analyst day, major contract announcement, index inclusion. Score HIGH (60-75) for: strong recent news flow showing momentum building, analyst upgrades, positive sector news. Score LOW (10-30) for: no meaningful news, general market mentions. UTILITIES SCORE 0-15 ON NEWS regardless of other factors — they are wrong strategy fit.
+- SECTOR (${w.sector}%): Strongly favor sectors with active catalysts and momentum. PENALIZE utilities (XLU), staples (XLP), REITs for catalyst swing — wrong profile entirely. ${marketContext.summary}`
   };
 
   const tickerLines = batch.map(t => {
     const d = t.data;
-    return `${t.ticker}: Price$${d.price} VWAP$${d.vwap?.toFixed(2)||'?'} ${d.vwapAbove?'AboveVWAP':'BelowVWAP'} DayMom${d.dayMomentum>0?'+':''}${d.dayMomentum}% RevGrowth${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'?'} Margins${d.marginTrend||'?'} MktCap${d.marketCap?'$'+Math.round(d.marketCap/1e9)+'B':'?'}`;
+    const news = t.news ? `News: "${t.news.substring(0, 150)}"` : 'News: none available';
+    return `${t.ticker}: VWAP${d.vwapAbove?'↑ABOVE':'↓BELOW'} DayMom${d.dayMomentum>0?'+':''}${d.dayMomentum}% RevGrowth${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'unknown'} MktCap${d.marketCap?'$'+Math.round(d.marketCap/1e9)+'B':'unknown'} | ${news}`;
   }).join('\n');
 
   const body = JSON.stringify({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 600,
-    system: stratHints[strategy] + ' Respond ONLY with JSON object mapping ticker to score 0-100.',
-    messages: [{ role: 'user', content: `Score each for ${strategy}:\n${tickerLines}\n\nJSON only: {"TICK1":85,"TICK2":42}` }]
+    max_tokens: 800,
+    system: `You are a stock screener. Apply these rules strictly:\n${stratRules[strategy]}\n\nCRITICAL: Every ticker in your response MUST have a UNIQUE score. Do not assign the same score to multiple tickers. Rank them precisely from best to worst fit for this strategy. Respond ONLY with a JSON object.`,
+    messages: [{
+      role: 'user',
+      content: `Score each ticker 0-100 for ${strategy} strategy. EVERY score must be unique — differentiate precisely based on the evidence. Utilities like WEC/ATO/DUK/AEE score 0-20 for catalyst strategy.\n\nTickers to score:\n${tickerLines}\n\nReturn JSON only with unique scores: {"TICK1": 87, "TICK2": 74, "TICK3": 61, ...} — NO duplicate values allowed.`
+    }]
   });
 
   const result = await fetchJson('https://api.anthropic.com/v1/messages', {
@@ -165,23 +210,29 @@ async function haikuScore(batch, strategy) {
   const text = result?.content?.find(b => b.type === 'text')?.text || '';
   try {
     const clean = text.replace(/```json\n?/g,'').replace(/```/g,'').trim();
-    return JSON.parse(clean);
+    const start = clean.indexOf('{');
+    const end = clean.lastIndexOf('}');
+    return JSON.parse(clean.substring(start, end+1));
   } catch(e) { return {}; }
 }
 
 // ── MAIN ──
 async function main() {
-  console.log('[Scan] Starting PulseStock universe scan with Polygon.io...');
+  console.log('[Scan] Starting PulseStock universe scan...');
+  console.log('[Scan] Sources: Polygon (price/VWAP/news/financials) + Haiku AI (strategy scoring)');
 
   const universe = await fetchJson(TICKER_URL);
   const tickers = universe?.all || [];
   console.log(`[Scan] ${tickers.length} tickers to scan`);
 
+  // Get market context FIRST — used in all Haiku scoring
+  const marketContext = await getMarketContext();
+
   const today = new Date().toISOString().split('T')[0];
   const strategies = ['momentum', 'compounder', 'catalyst'];
 
-  // Phase 1: Collect Polygon data for all tickers
-  console.log('\n[Scan] Phase 1: Fetching Polygon data...');
+  // Phase 1: Collect data for all tickers
+  console.log('\n[Scan] Phase 1: Collecting Polygon data...');
   const allData = {};
   let processed = 0;
 
@@ -194,89 +245,102 @@ async function main() {
       continue;
     }
 
-    // Get details for larger caps (skip for speed on penny stocks)
-    let details = null;
-    let financials = null;
-    if (prev.c >= 1) { // only fetch details for stocks with price data
-      details = await getTickerDetails(ticker);
-      // Only fetch financials for established companies (market cap > $100M)
-      if (details?.market_cap && details.market_cap > 1e8) {
-        financials = await getFinancials(ticker);
+    // Quality filters
+    if (!prev.v || prev.v < 500000) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
+    if (!prev.h || !prev.l) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
+    const dayRangePct = (prev.h - prev.l) / prev.l * 100;
+    if (dayRangePct < 0.5 || dayRangePct > 25) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
+    const vwapDev = Math.abs(prev.c - prev.vw) / prev.vw * 100;
+    if (vwapDev > 20) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
+
+    const vwapAbove = prev.c > prev.vw;
+    const dayMomentum = parseFloat(((prev.c - prev.o) / prev.o * 100).toFixed(2));
+
+    // Get details for market cap
+    const details = await getTickerDetails(ticker);
+    const marketCap = details?.market_cap || null;
+
+    // Get financials for established companies
+    let revenueGrowth = null;
+    let marginTrend = null;
+    if (marketCap && marketCap > 5e7) {
+      const financials = await getFinancials(ticker);
+      if (financials && financials.length >= 2) {
+        const q1rev = financials[0]?.financials?.income_statement?.revenues?.value;
+        const q2rev = financials[1]?.financials?.income_statement?.revenues?.value;
+        if (q1rev && q2rev && q2rev > 0) revenueGrowth = parseFloat(((q1rev - q2rev) / q2rev).toFixed(3));
+        const q1ni = financials[0]?.financials?.income_statement?.net_income_loss?.value;
+        const q2ni = financials[1]?.financials?.income_statement?.net_income_loss?.value;
+        if (q1ni !== null && q2ni !== null) marginTrend = q1ni > q2ni ? 'expanding' : 'contracting';
       }
     }
 
-    const scored = calculateScores(ticker, prev, details, financials);
-    if (scored) allData[ticker] = scored;
+    // Get news
+    const news = await getTickerNews(ticker);
+
+    allData[ticker] = {
+      price: prev.c, vwap: prev.vw, vwapAbove, dayMomentum,
+      volume: prev.v, marketCap, revenueGrowth, marginTrend, news
+    };
 
     if (processed % 100 === 0) {
       console.log(`[Scan] Phase 1: ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`);
     }
   }
 
-  console.log(`\n[Scan] Phase 1 complete: ${Object.keys(allData).length} tickers with valid Polygon data`);
+  console.log(`\n[Scan] Phase 1 complete: ${Object.keys(allData).length} tickers with valid data`);
 
   // Phase 2 & 3: Filter + AI score per strategy
   for (const strategy of strategies) {
     console.log(`\n[Scan] Processing ${strategy}...`);
 
-    // Mechanical filter
     const filtered = Object.keys(allData).filter(t => {
       const d = allData[t];
-      if (strategy === 'momentum') {
-        // Uptrend confirmation: above VWAP, positive day momentum, sufficient volume
-        return d.vwapAbove && d.dayMomentum > -3 && d.volume > 1000000;
-      }
-      if (strategy === 'compounder') {
-        // Quality filter: meaningful market cap, above VWAP, positive revenue growth
-        return d.marketCap && d.marketCap > 2e8 && d.vwapAbove;
-      }
-      if (strategy === 'catalyst') {
-        // Technical setup: above VWAP (smart money in), volume active, not extended
-        const vwapDev = Math.abs(d.price - d.vwap) / d.vwap * 100;
-        return d.vwapAbove && d.volume > 500000 && vwapDev < 10;
-      }
+      if (strategy === 'momentum') return d.vwapAbove && d.volume > 1000000;
+      if (strategy === 'compounder') return d.marketCap && d.marketCap > 2e8;
+      if (strategy === 'catalyst') return d.vwapAbove && d.volume > 500000;
       return true;
     });
 
     console.log(`[Scan] ${strategy}: ${filtered.length} pass mechanical filter`);
 
-    // Haiku AI scoring in batches of 20
+    // Haiku scoring in batches of 15 (smaller for better differentiation)
     const aiScores = {};
     if (ANTHROPIC_KEY && filtered.length > 0) {
-      console.log(`[Scan] ${strategy}: AI scoring ${filtered.length} candidates...`);
-      const BATCH = 20;
+      console.log(`[Scan] ${strategy}: AI scoring with market context + news...`);
+      const BATCH = 15;
       for (let i = 0; i < filtered.length; i += BATCH) {
-        const batch = filtered.slice(i, i+BATCH).map(t => ({ ticker: t, data: allData[t] }));
-        const scores = await haikuScore(batch, strategy);
+        const batch = filtered.slice(i, i+BATCH).map(t => ({
+          ticker: t,
+          data: allData[t],
+          news: allData[t].news
+        }));
+        const scores = await haikuScore(batch, strategy, marketContext);
         Object.assign(aiScores, scores);
-        if (i % 100 === 0 && i > 0) console.log(`[Scan] ${strategy}: AI scored ${i}/${filtered.length}`);
-        await delay(300);
+        if (i % 150 === 0 && i > 0) console.log(`[Scan] ${strategy}: AI scored ${i}/${filtered.length}`);
+        await delay(200);
       }
     }
 
-    // Combine and rank
+    // Rank by AI score (primary) + mechanical boost
     const ranked = filtered.map(t => {
       const d = allData[t];
       const aiScore = aiScores[t] || 0;
-      // Mechanical score
       let mech = 0;
-      if (d.vwapAbove) mech += 30;
-      if (d.dayMomentum > 0) mech += 20;
-      if (d.revenueGrowth && d.revenueGrowth > 0) mech += 25;
-      if (d.marginTrend === 'expanding') mech += 15;
+      if (d.vwapAbove) mech += 20;
+      if (d.dayMomentum > 0) mech += 15;
+      if (d.revenueGrowth && d.revenueGrowth > 0) mech += 20;
+      if (d.marginTrend === 'expanding') mech += 10;
       if (d.marketCap && d.marketCap > 1e9) mech += 10;
+      if (d.news) mech += 5; // has recent news
 
-      const combined = aiScore > 0 ? (mech * 0.35) + (aiScore * 0.65) : mech;
-
+      const combined = aiScore > 0 ? (mech * 0.25) + (aiScore * 0.75) : mech;
       return {
-        ticker: t,
-        score: parseFloat(combined.toFixed(2)),
-        price: d.price,
-        vwap: d.vwap,
-        vwapAbove: d.vwapAbove,
-        revenueGrowth: d.revenueGrowth,
-        marketCap: d.marketCap,
-        reason: `VWAP${d.vwapAbove?'↑':'↓'} DayMom${d.dayMomentum>0?'+':''}${d.dayMomentum}% RevGrow${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'?'} AI:${aiScore||'mech'}`
+        ticker: t, score: parseFloat(combined.toFixed(2)),
+        price: d.price, vwap: d.vwap, vwapAbove: d.vwapAbove,
+        revenueGrowth: d.revenueGrowth, marketCap: d.marketCap,
+        hasNews: !!d.news,
+        reason: `AI:${aiScore||'?'} VWAP${d.vwapAbove?'↑':'↓'} Mom${d.dayMomentum>0?'+':''}${d.dayMomentum}% Rev${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'?'} News:${d.news?'yes':'no'}`
       };
     }).sort((a,b) => b.score - a.score);
 
@@ -291,7 +355,7 @@ async function main() {
         screen_score: c.score, screen_reason: c.reason,
         price: c.price, trading_date: today
       });
-      if (i % 50 === 0 && i > 0) console.log(`[Scan] ${strategy}: saved ${i}/${ranked.length}`);
+      if (i % 100 === 0 && i > 0) console.log(`[Scan] ${strategy}: saved ${i}/${ranked.length}`);
     }
     console.log(`[Scan] ${strategy}: saved ${ranked.length} candidates`);
   }
