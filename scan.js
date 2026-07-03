@@ -81,6 +81,18 @@ function calculateScores(ticker, prev, details, financials) {
 
   const price = prev.c;
   const vwap = prev.vw;
+  const volume = prev.v;
+
+  // Hard quality filters — must pass ALL of these
+  if (price < 2) return null;                          // no penny stocks
+  if (!vwap || vwap <= 0) return null;                 // must have VWAP
+  if (!volume || volume < 500000) return null;         // minimum 500K daily volume
+  if (!prev.h || !prev.l) return null;                 // must have day range
+  const dayRangePct = (prev.h - prev.l) / prev.l * 100;
+  if (dayRangePct < 0.5) return null;                  // frozen stock filter
+  if (dayRangePct > 25) return null;                   // wildly volatile/halted
+  const vwapDeviation = Math.abs(price - vwap) / vwap * 100;
+  if (vwapDeviation > 20) return null;                 // not wildly extended from VWAP
   const high = prev.h;
   const low = prev.l;
   const open = prev.o;
@@ -212,9 +224,19 @@ async function main() {
     // Mechanical filter
     const filtered = Object.keys(allData).filter(t => {
       const d = allData[t];
-      if (strategy === 'momentum') return d.vwapAbove && d.dayMomentum > -5;
-      if (strategy === 'compounder') return d.marketCap && d.marketCap > 5e8; // $500M+ for quality
-      if (strategy === 'catalyst') return d.vwapAbove; // VWAP is the primary gate
+      if (strategy === 'momentum') {
+        // Uptrend confirmation: above VWAP, positive day momentum, sufficient volume
+        return d.vwapAbove && d.dayMomentum > -3 && d.volume > 1000000;
+      }
+      if (strategy === 'compounder') {
+        // Quality filter: meaningful market cap, above VWAP, positive revenue growth
+        return d.marketCap && d.marketCap > 2e8 && d.vwapAbove;
+      }
+      if (strategy === 'catalyst') {
+        // Technical setup: above VWAP (smart money in), volume active, not extended
+        const vwapDev = Math.abs(d.price - d.vwap) / d.vwap * 100;
+        return d.vwapAbove && d.volume > 500000 && vwapDev < 10;
+      }
       return true;
     });
 
