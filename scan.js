@@ -43,7 +43,7 @@ async function getMetric(ticker) {
 }
 
 function scoreForStrategy(quote, metric, strategy) {
-  if (!quote || !quote.c || quote.c < 5) return null;
+  if (!quote || !quote.c || quote.c <= 0) return null;
   const price = quote.c;
   const prevClose = quote.pc || price;
   if (!metric) return null;
@@ -53,7 +53,13 @@ function scoreForStrategy(quote, metric, strategy) {
   const rsi = metric['rsi14d'] ? parseFloat(metric['rsi14d']) : null;
   const beta = metric['beta'] ? parseFloat(metric['beta']) : null;
 
+  // Quality filters — remove illiquid/thin stocks regardless of price
   if (!w52h || !w52l || w52h <= w52l) return null;
+  if (!rsi) return null; // RSI must exist — proxy for trading activity
+  const range52w = w52h - w52l;
+  if (range52w / w52l < 0.05) return null; // 52W range must be at least 5% — filters flat/frozen stocks
+  if (price > w52h * 1.05) return null; // price shouldn't be above 52W high by more than 5%
+
   const rangePos = ((price - w52l) / (w52h - w52l)) * 100;
   const vwapAbove = price > prevClose;
   let score = 0;
