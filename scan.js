@@ -95,7 +95,6 @@ function calculateScores(ticker, prev, details, financials) {
   const high = prev.h;
   const low = prev.l;
   const open = prev.o;
-  const volume = prev.v;
 
   // Need 52W data — use prev day high/low as proxy for now, get from snapshot
   // For mechanical scoring use what we have
@@ -123,7 +122,7 @@ function calculateScores(ticker, prev, details, financials) {
   }
 
   return {
-    price, vwap, vwapAbove, volume,
+    price, vwap, vwapAbove, volume: prev.v,
     dayMomentum: parseFloat(dayMomentum.toFixed(2)),
     marketCap, sharesOutstanding,
     revenueGrowth: revenueGrowth ? parseFloat(revenueGrowth.toFixed(3)) : null,
