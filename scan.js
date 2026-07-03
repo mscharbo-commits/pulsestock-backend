@@ -120,8 +120,10 @@ async function main() {
 
   // Save top 50 per strategy
   for (const strategy of strategies) {
-    const sorted = allScored[strategy].sort((a, b) => b.score - a.score).slice(0, 50);
-    console.log(`[Scan] ${strategy}: ${sorted.length} candidates`);
+    const sorted = allScored[strategy].sort((a, b) => b.score - a.score);
+    // No artificial cap — however many tickers genuinely pass the criteria is the right number
+    // Momentum might have 80, Compounder 40, Catalyst 25 — that's real signal not a quota
+    console.log(`[Scan] ${strategy}: ${sorted.length} candidates naturally qualified`);
 
     await sb('DELETE', 'pre_screened_candidates', null, `?strategy_id=eq.${strategy}&trading_date=eq.${today}`);
 
