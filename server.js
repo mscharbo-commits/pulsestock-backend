@@ -51,7 +51,7 @@ async function sb(method, table, data, params = '') {
 // ── FINNHUB ──
 async function getQuote(ticker) {
   try {
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 100));
     const r = await fetchJson(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FHK}`);
     return r.body && r.body.c > 0 ? r.body : null;
   } catch (e) { return null; }
@@ -59,7 +59,7 @@ async function getQuote(ticker) {
 
 async function getMetric(ticker) {
   try {
-    await new Promise(r => setTimeout(r, 300));
+    await new Promise(r => setTimeout(r, 100));
     const r = await fetchJson(`https://finnhub.io/api/v1/stock/metric?symbol=${ticker}&metric=all&token=${FHK}`);
     return r.body && r.body.metric ? r.body.metric : null;
   } catch (e) { return null; }
@@ -151,13 +151,16 @@ async function runDailyScreen() {
       const scored = [];
 
       // Process in batches of 50 to keep memory low
-      for (let i = 0; i < universe.length; i += 50) {
-        const batch = universe.slice(i, i + 50);
+      // Process in parallel batches of 10 for speed
+      for (let i = 0; i < universe.length; i += 10) {
+        const batch = universe.slice(i, i + 10);
         const results = await Promise.all(batch.map(t => scoreForStrategy(t, strategy).catch(() => null)));
         results.forEach(r => { if (r) scored.push(r); });
-        if (i % 500 === 0) {
+        if (i % 200 === 0) {
           console.log(`[Screen] ${strategy}: ${i}/${universe.length} done, ${scored.length} candidates`);
         }
+        // Small delay between batches to avoid rate limits
+        await new Promise(r => setTimeout(r, 100));
       }
 
       scored.sort((a, b) => b.score - a.score);
