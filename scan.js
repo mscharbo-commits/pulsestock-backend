@@ -355,8 +355,7 @@ async function main() {
     // Save to Supabase
     await sb('DELETE', 'pre_screened_candidates', null, `?strategy_id=eq.${strategy}&trading_date=eq.${today}`);
     for (let i = 0; i < toSave.length; i++) {
-      const c = toSave[i]; // override loop variable below
-      const c = ranked[i];
+      const c = toSave[i];
       await sb('POST', 'pre_screened_candidates', {
         strategy_id: strategy, ticker: c.ticker, rank: i+1,
         screen_score: c.score, screen_reason: c.reason,
