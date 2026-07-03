@@ -344,11 +344,18 @@ async function main() {
       };
     }).sort((a,b) => b.score - a.score);
 
-    console.log(`[Scan] ${strategy}: ${ranked.length} ranked — Top 5: ${ranked.slice(0,5).map(r=>r.ticker+'('+r.score+')').join(', ')}`);
+    // Apply minimum score cutoff — only genuinely high-conviction candidates
+    const MIN_SCORE = 65;
+    const qualified = ranked.filter(r => r.score >= MIN_SCORE);
+    console.log(`[Scan] ${strategy}: ${ranked.length} ranked, ${qualified.length} above ${MIN_SCORE} threshold — Top 5: ${(qualified.length ? qualified : ranked).slice(0,5).map(r=>r.ticker+'('+r.score+')').join(', ')}`);
+
+    // Use qualified list, fall back to top 50 if too few qualify
+    const toSave = qualified.length >= 10 ? qualified : ranked.slice(0, 50);
 
     // Save to Supabase
     await sb('DELETE', 'pre_screened_candidates', null, `?strategy_id=eq.${strategy}&trading_date=eq.${today}`);
-    for (let i = 0; i < ranked.length; i++) {
+    for (let i = 0; i < toSave.length; i++) {
+      const c = toSave[i]; // override loop variable below
       const c = ranked[i];
       await sb('POST', 'pre_screened_candidates', {
         strategy_id: strategy, ticker: c.ticker, rank: i+1,
@@ -357,7 +364,7 @@ async function main() {
       });
       if (i % 100 === 0 && i > 0) console.log(`[Scan] ${strategy}: saved ${i}/${ranked.length}`);
     }
-    console.log(`[Scan] ${strategy}: saved ${ranked.length} candidates`);
+    console.log(`[Scan] ${strategy}: saved ${toSave.length} qualified candidates (score >= ${MIN_SCORE})`);
   }
 
   console.log('\n[Scan] Complete!');
