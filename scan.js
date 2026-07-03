@@ -81,12 +81,11 @@ function calculateScores(ticker, prev, details, financials) {
 
   const price = prev.c;
   const vwap = prev.vw;
-  const volume = prev.v;
 
   // Hard quality filters — must pass ALL of these
   if (price < 2) return null;                          // no penny stocks
   if (!vwap || vwap <= 0) return null;                 // must have VWAP
-  if (!volume || volume < 500000) return null;         // minimum 500K daily volume
+  if (!prev.v || prev.v < 500000) return null;         // minimum 500K daily volume
   if (!prev.h || !prev.l) return null;                 // must have day range
   const dayRangePct = (prev.h - prev.l) / prev.l * 100;
   if (dayRangePct < 0.5) return null;                  // frozen stock filter
