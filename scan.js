@@ -1,4 +1,5 @@
 // PulseStock Universe Scanner — run nightly: node scan.js
+// v2.1 fixed
 // Full scoring: Polygon (technicals + news) + Market/Sector context + Haiku AI ranking
 
 const https = require('https');
