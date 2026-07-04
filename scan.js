@@ -146,6 +146,11 @@ async function getTickerDetails(ticker) {
   return d?.results || null;
 }
 
+async function getSnapshot(ticker) {
+  const d = await poly(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
+  return d?.ticker || null;
+}
+
 async function getFinancials(ticker) {
   const d = await poly(`/vX/reference/financials?ticker=${ticker}&limit=4&timeframe=quarterly`);
   return d?.results || null;
@@ -257,9 +262,31 @@ async function main() {
     const vwapAbove = prev.c > prev.vw;
     const dayMomentum = parseFloat(((prev.c - prev.o) / prev.o * 100).toFixed(2));
 
-    // Get details for market cap
+    // Get snapshot for 52W range position (critical for structure gate)
+    const snap = await getSnapshot(ticker);
+    const w52h = snap?.day?.h || snap?.prevDay?.h || null; // use day high as proxy
+    const todayHigh = snap?.day?.h || null;
+    const todayLow = snap?.day?.l || null;
+    
+    // Get 52W range from reference endpoint
     const details = await getTickerDetails(ticker);
     const marketCap = details?.market_cap || null;
+    const sharesFl = details?.share_class_shares_outstanding || null;
+
+    // Compute 52W range position using Polygon aggregates (1 year)
+    const yearAgo = new Date(Date.now() - 365*86400000).toISOString().split('T')[0];
+    const today52 = new Date().toISOString().split('T')[0];
+    const aggs = await poly('/v2/aggs/ticker/'+ticker+'/range/1/day/'+yearAgo+'/'+today52+'?adjusted=true&sort=asc&limit=252');
+    let rangePos = null;
+    if (aggs?.results?.length > 10) {
+      const highs = aggs.results.map(r => r.h);
+      const lows = aggs.results.map(r => r.l);
+      const yearHigh = Math.max(...highs);
+      const yearLow = Math.min(...lows);
+      if (yearHigh > yearLow) {
+        rangePos = parseFloat(((prev.c - yearLow) / (yearHigh - yearLow) * 100).toFixed(1));
+      }
+    }
 
     // Get financials for established companies
     let revenueGrowth = null;
@@ -281,7 +308,8 @@ async function main() {
 
     allData[ticker] = {
       price: prev.c, vwap: prev.vw, vwapAbove, dayMomentum,
-      volume: prev.v, marketCap, revenueGrowth, marginTrend, news
+      volume: prev.v, marketCap, revenueGrowth, marginTrend, news,
+      rangePos, sharesFl
     };
 
     if (processed % 100 === 0) {
@@ -297,9 +325,24 @@ async function main() {
 
     const filtered = Object.keys(allData).filter(t => {
       const d = allData[t];
-      if (strategy === 'momentum') return d.vwapAbove && d.volume > 1000000;
-      if (strategy === 'compounder') return d.marketCap && d.marketCap > 2e8;
-      if (strategy === 'catalyst') return d.vwapAbove && d.volume > 500000;
+      // Apply SAME hard gates Sonnet uses — so 75%+ of candidates pass deep dive
+      if (strategy === 'momentum') {
+        if (!d.vwapAbove) return false;                    // must be above VWAP
+        if (d.volume < 1000000) return false;              // minimum volume
+        if (d.rangePos !== null && d.rangePos < 55) return false;  // must be in uptrend
+        return true;
+      }
+      if (strategy === 'compounder') {
+        if (!d.marketCap || d.marketCap < 1e9) return false;  // $1B+ market cap
+        if (d.rangePos !== null && d.rangePos < 40) return false;  // not in deep downtrend
+        return true;
+      }
+      if (strategy === 'catalyst') {
+        if (!d.vwapAbove) return false;                    // VWAP hard gate
+        if (d.volume < 500000) return false;               // minimum volume
+        if (d.rangePos !== null && (d.rangePos < 30 || d.rangePos > 85)) return false; // not at extremes
+        return true;
+      }
       return true;
     });
 
