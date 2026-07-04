@@ -1,6 +1,10 @@
-// PulseStock Universe Scanner — run nightly: node scan.js
-// v2.1 fixed
-// Full scoring: Polygon (technicals + news) + Market/Sector context + Haiku AI ranking
+// PulseStock Universe Scanner v3.0 — Minervini/CAN SLIM Foundation
+// Run nightly: node scan.js
+// Phase 1: Quick filter (VWAP, volume, price)
+// Phase 2: Fetch 200-day candles for survivors
+// Phase 3: Compute MAs, Trend Template, Bollinger Bands, relative strength
+// Phase 4: Strategy-specific filters
+// Phase 5: Haiku AI scoring with news + market context
 
 const https = require('https');
 const http = require('http');
@@ -13,7 +17,7 @@ const TICKER_URL = 'https://raw.githubusercontent.com/mscharbo-commits/pulsestoc
 
 function fetchJson(url, opts = {}) {
   return new Promise((resolve) => {
-    const timeout = setTimeout(() => resolve(null), 10000);
+    const timeout = setTimeout(() => resolve(null), 12000);
     const mod = url.startsWith('https') ? https : http;
     const req = mod.request(url, {
       method: opts.method || 'GET',
@@ -54,360 +58,448 @@ async function sb(method, table, data, params = '') {
   });
 }
 
-// ── MARKET CONTEXT (runs once at scan start) ──
-async function getMarketContext() {
-  console.log('[Scan] Fetching market context (SPY, VIX, sector ETFs)...');
-  
-  const [spy, vix, xlk, xlf, xle, xlv, xli, xlp, xlu, xlb, xly, xlre, xlc] = await Promise.all([
-    poly('/v2/aggs/ticker/SPY/prev'),
-    poly('/v2/aggs/ticker/VIXY/prev'), // VIX proxy ETF
-    poly('/v2/aggs/ticker/XLK/prev'),  // Tech
-    poly('/v2/aggs/ticker/XLF/prev'),  // Financials
-    poly('/v2/aggs/ticker/XLE/prev'),  // Energy
-    poly('/v2/aggs/ticker/XLV/prev'),  // Healthcare
-    poly('/v2/aggs/ticker/XLI/prev'),  // Industrials
-    poly('/v2/aggs/ticker/XLP/prev'),  // Consumer Staples
-    poly('/v2/aggs/ticker/XLU/prev'),  // Utilities
-    poly('/v2/aggs/ticker/XLB/prev'),  // Materials
-    poly('/v2/aggs/ticker/XLY/prev'),  // Consumer Discretionary
-    poly('/v2/aggs/ticker/XLRE/prev'), // Real Estate
-    poly('/v2/aggs/ticker/XLC/prev')   // Communication
-  ]);
-
-  const getReturn = (d) => {
-    const r = d?.results?.[0];
-    if (!r || !r.o) return null;
-    return ((r.c - r.o) / r.o * 100).toFixed(2);
-  };
-
-  const spyRet = getReturn(spy);
-  const vixLevel = vix?.results?.[0]?.c;
-
-  const sectorReturns = {
-    'XLK (Tech)': getReturn(xlk),
-    'XLF (Financials)': getReturn(xlf),
-    'XLE (Energy)': getReturn(xle),
-    'XLV (Healthcare)': getReturn(xlv),
-    'XLI (Industrials)': getReturn(xli),
-    'XLP (Staples)': getReturn(xlp),
-    'XLU (Utilities)': getReturn(xlu),
-    'XLB (Materials)': getReturn(xlb),
-    'XLY (Discretionary)': getReturn(xly),
-    'XLRE (Real Estate)': getReturn(xlre),
-    'XLC (Communication)': getReturn(xlc)
-  };
-
-  // Identify leading and lagging sectors
-  const sorted = Object.entries(sectorReturns)
-    .filter(([,v]) => v !== null)
-    .sort((a,b) => parseFloat(b[1]) - parseFloat(a[1]));
-
-  const leading = sorted.slice(0, 3).map(([k,v]) => `${k}:+${v}%`).join(', ');
-  const lagging = sorted.slice(-3).map(([k,v]) => `${k}:${v}%`).join(', ');
-
-  const regime = parseFloat(spyRet) > 0.3 ? 'BULL' : parseFloat(spyRet) < -0.3 ? 'BEAR' : 'NEUTRAL';
-  const vixWarning = vixLevel && vixLevel > 20 ? `HIGH VIX (${vixLevel}) — reduce position sizing, wider stops` : `Low volatility (VIX proxy: ${vixLevel || '?'})`;
-
-  const context = {
-    spyReturn: spyRet,
-    regime,
-    vixLevel,
-    vixWarning,
-    leading,
-    lagging,
-    sectorReturns,
-    summary: `Market: SPY${spyRet >= 0 ? '+' : ''}${spyRet}% (${regime}). ${vixWarning}. Leading sectors: ${leading}. Lagging: ${lagging}.`
-  };
-
-  console.log(`[Market] ${context.summary}`);
-  return context;
+// ── TECHNICAL INDICATOR CALCULATIONS ──
+function sma(arr, period) {
+  if (arr.length < period) return null;
+  const slice = arr.slice(-period);
+  return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// ── NEWS FETCHER ──
-async function getTickerNews(ticker) {
-  await delay(100);
-  const today = new Date().toISOString().split('T')[0];
+function ema(arr, period) {
+  if (arr.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < arr.length; i++) {
+    ema = arr[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function bollingerBands(closes, period = 20) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const avg = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((a, b) => a + Math.pow(b - avg, 2), 0) / period;
+  const stdDev = Math.sqrt(variance);
+  return {
+    upper: avg + 2 * stdDev,
+    middle: avg,
+    lower: avg - 2 * stdDev,
+    bandwidth: (4 * stdDev) / avg * 100 // % width — low = squeeze
+  };
+}
+
+function rsi(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff > 0) gains += diff;
+    else losses -= diff;
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return parseFloat((100 - 100 / (1 + rs)).toFixed(1));
+}
+
+function computeAllIndicators(candles) {
+  if (!candles || candles.length < 50) return null;
+  const closes = candles.map(c => c.c);
+  const highs = candles.map(c => c.h);
+  const lows = candles.map(c => c.l);
+  const volumes = candles.map(c => c.v);
+  const current = closes[closes.length - 1];
+
+  const ma20 = sma(closes, 20);
+  const ma50 = sma(closes, 50);
+  const ma150 = sma(closes, 150);
+  const ma200 = sma(closes, 200);
+  const ema20 = ema(closes, 20);
+
+  // 200-day MA trend: compare current 200MA to 60 days ago
+  const ma200_60dAgo = candles.length >= 260 ? sma(closes.slice(0, -60), 200) : null;
+  const ma200Rising = ma200 && ma200_60dAgo ? ma200 > ma200_60dAgo : null;
+
+  // 52-week stats
+  const year = Math.min(252, candles.length);
+  const yearHighs = highs.slice(-year);
+  const yearLows = lows.slice(-year);
+  const w52High = Math.max(...yearHighs);
+  const w52Low = Math.min(...yearLows);
+  const rangePos = w52High > w52Low ? parseFloat(((current - w52Low) / (w52High - w52Low) * 100).toFixed(1)) : null;
+  const pctFromHigh = w52High > 0 ? parseFloat(((current - w52High) / w52High * 100).toFixed(1)) : null;
+  const pctAboveLow = w52Low > 0 ? parseFloat(((current - w52Low) / w52Low * 100).toFixed(1)) : null;
+
+  // Volume analysis
+  const avgVol30 = sma(volumes, 30);
+  const todayVol = volumes[volumes.length - 1];
+  const rvol = avgVol30 ? parseFloat((todayVol / avgVol30).toFixed(2)) : null;
+
+  // Bollinger Bands
+  const bb = bollingerBands(closes, 20);
+
+  // RSI
+  const rsiVal = rsi(closes, 14);
+
+  // 6-month return (relative momentum)
+  const sixMonthAgo = closes[Math.max(0, closes.length - 126)];
+  const return6m = sixMonthAgo ? parseFloat(((current - sixMonthAgo) / sixMonthAgo * 100).toFixed(1)) : null;
+
+  // 3-month return
+  const threeMonthAgo = closes[Math.max(0, closes.length - 63)];
+  const return3m = threeMonthAgo ? parseFloat(((current - threeMonthAgo) / threeMonthAgo * 100).toFixed(1)) : null;
+
+  // VWAP (today's - use last candle vw if available)
+  const todayVwap = candles[candles.length - 1].vw || null;
+  const vwapAbove = todayVwap ? current > todayVwap : null;
+
+  return {
+    current, ma20, ma50, ma150, ma200, ema20,
+    ma200Rising, w52High, w52Low, rangePos,
+    pctFromHigh, pctAboveLow, rvol, bb, rsiVal,
+    return6m, return3m, todayVwap, vwapAbove, avgVol30,
+    // Dollar volume
+    dollarVol: parseFloat((todayVol * current / 1e6).toFixed(1)) // in millions
+  };
+}
+
+// ── MINERVINI TREND TEMPLATE ──
+function trendTemplateScore(ind) {
+  if (!ind || !ind.ma50 || !ind.ma150 || !ind.ma200) return { passes: false, score: 0, details: 'insufficient MA data' };
+  
+  const checks = {
+    priceAboveMa50: ind.current > ind.ma50,
+    priceAboveMa150: ind.current > ind.ma150,
+    priceAboveMa200: ind.current > ind.ma200,
+    ma50AboveMa150: ind.ma50 > ind.ma150,
+    ma50AboveMa200: ind.ma50 > ind.ma200,
+    ma150AboveMa200: ind.ma150 > ind.ma200,
+    ma200Rising: ind.ma200Rising === true,
+    within25OfHigh: ind.pctFromHigh !== null && ind.pctFromHigh >= -25,
+    above30FromLow: ind.pctAboveLow !== null && ind.pctAboveLow >= 30,
+    rsiAbove70: ind.rsiVal !== null && ind.rsiVal > 70
+  };
+
+  const passed = Object.values(checks).filter(Boolean).length;
+  const total = Object.keys(checks).length;
+  const passes = passed >= 8; // require 8 of 10
+
+  return {
+    passes,
+    score: parseFloat((passed / total * 100).toFixed(1)),
+    passed,
+    total,
+    details: Object.entries(checks).filter(([,v]) => !v).map(([k]) => k).join(', ')
+  };
+}
+
+// ── MARKET CONTEXT ──
+async function getMarketContext() {
+  console.log('[Scan] Fetching market context...');
+  const etfs = ['SPY', 'VIXY', 'XLK', 'XLF', 'XLE', 'XLV', 'XLI', 'XLP', 'XLU', 'XLB', 'XLY', 'XLRE', 'XLC'];
+  const results = await Promise.all(etfs.map(t => poly(`/v2/aggs/ticker/${t}/prev`)));
+  
+  const getReturn = (d) => {
+    const r = d?.results?.[0];
+    return r && r.o ? parseFloat(((r.c - r.o) / r.o * 100).toFixed(2)) : null;
+  };
+
+  const spyRet = getReturn(results[0]);
+  const vixLevel = results[1]?.results?.[0]?.c;
+  const sectorNames = ['XLK(Tech)', 'XLF(Fin)', 'XLE(Energy)', 'XLV(Health)', 'XLI(Indust)', 'XLP(Staples)', 'XLU(Utils)', 'XLB(Matls)', 'XLY(Discret)', 'XLRE(RE)', 'XLC(Comm)'];
+  const sectorReturns = results.slice(2).map((r, i) => ({ name: sectorNames[i], ret: getReturn(r) }))
+    .filter(s => s.ret !== null).sort((a, b) => b.ret - a.ret);
+
+  const regime = spyRet > 0.5 ? 'BULL' : spyRet < -0.5 ? 'BEAR' : 'NEUTRAL';
+  const vixWarning = vixLevel > 20 ? `HIGH VIX ${vixLevel} — reduce sizing` : `VIX ${vixLevel} — normal`;
+  const leading = sectorReturns.slice(0, 3).map(s => `${s.name}:${s.ret > 0 ? '+' : ''}${s.ret}%`).join(', ');
+  const lagging = sectorReturns.slice(-3).map(s => `${s.name}:${s.ret}%`).join(', ');
+
+  const ctx = { spyRet, regime, vixLevel, vixWarning, leading, lagging, sectorReturns,
+    summary: `SPY${spyRet >= 0 ? '+' : ''}${spyRet}% (${regime}). ${vixWarning}. Leading: ${leading}. Lagging: ${lagging}.` };
+  console.log(`[Market] ${ctx.summary}`);
+  return ctx;
+}
+
+// ── NEWS ──
+async function getNews(ticker) {
+  await delay(80);
   const weekAgo = new Date(Date.now() - 7*86400000).toISOString().split('T')[0];
   const d = await poly(`/v2/reference/news?ticker=${ticker}&published_utc.gte=${weekAgo}&limit=5&sort=published_utc&order=desc`);
   const articles = d?.results || [];
-  if (!articles.length) return null;
-  // Return just the headlines for Haiku to analyze
-  return articles.map(a => a.title).slice(0, 5).join(' | ');
+  return articles.length ? articles.map(a => a.title).slice(0, 4).join(' | ') : null;
 }
 
-// ── POLYGON DATA ──
-async function getPrevDay(ticker) {
-  const d = await poly(`/v2/aggs/ticker/${ticker}/prev`);
-  return d?.results?.[0] || null;
-}
-
-async function getTickerDetails(ticker) {
-  const d = await poly(`/v3/reference/tickers/${ticker}`);
-  return d?.results || null;
-}
-
-async function getSnapshot(ticker) {
-  const d = await poly(`/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`);
-  return d?.ticker || null;
-}
-
+// ── FINANCIALS ──
 async function getFinancials(ticker) {
+  await delay(80);
   const d = await poly(`/vX/reference/financials?ticker=${ticker}&limit=4&timeframe=quarterly`);
-  return d?.results || null;
+  const results = d?.results || [];
+  if (results.length < 2) return null;
+  const q0 = results[0]?.financials?.income_statement;
+  const q1 = results[1]?.financials?.income_statement;
+  if (!q0 || !q1) return null;
+  const rev0 = q0.revenues?.value;
+  const rev1 = q1.revenues?.value;
+  const ni0 = q0.net_income_loss?.value;
+  const ni1 = q1.net_income_loss?.value;
+  return {
+    revenueGrowth: rev0 && rev1 && rev1 > 0 ? parseFloat(((rev0 - rev1) / rev1 * 100).toFixed(1)) : null,
+    earningsGrowth: ni0 && ni1 && ni1 > 0 ? parseFloat(((ni0 - ni1) / ni1 * 100).toFixed(1)) : null,
+    marginTrend: ni0 && ni1 ? (ni0 > ni1 ? 'expanding' : 'contracting') : null
+  };
 }
 
-// ── HAIKU BATCH SCORER ──
+// ── HAIKU SCORER ──
 async function haikuScore(batch, strategy, marketContext) {
   if (!ANTHROPIC_KEY || !batch.length) return {};
 
-  const weights = {
-    momentum:   { tech: 30, fundamental: 25, news: 25, sector: 20 },
-    compounder: { tech: 20, fundamental: 40, news: 15, sector: 25 },
-    catalyst:   { tech: 25, fundamental: 15, news: 45, sector: 15 }
-  };
-  const w = weights[strategy];
-
   const stratRules = {
-    momentum: `MOMENTUM GROWTH RULES:
-- TECHNICALS (${w.tech}%): Price structure HH/HL is paramount. VWAP above = institutional buying. RSI 45-75 building not exhausted. Relative strength vs sector ETF positive. PENALIZE heavily: downtrends, broken structure, RSI>80 exhausted.
-- FUNDAMENTALS (${w.fundamental}%): Must show 2+ consecutive quarters of revenue growth. Positive EPS trend. Reasonable valuation. PENALIZE: negative revenue growth, earnings misses, China-domiciled companies (score 0-10 max).
-- NEWS (${w.news}%): Score HIGH for: earnings beats, guidance raises, analyst upgrades, product launches, major contract wins. Score LOW for: general market commentary, price target reiterations with no change, irrelevant mentions. Score NEAR ZERO for: earnings misses, guidance cuts, lawsuits, SEC investigations, CEO departure.
-- SECTOR (${w.sector}%): Heavily favor sectors currently leading the market. PENALIZE sectors with negative momentum. ${marketContext.summary}`,
+    momentum: `MOMENTUM GROWTH — Minervini/CAN SLIM methodology. Score HIGHEST for:
+- Full Trend Template compliance (all MAs aligned, above 50/150/200 MAs, 200MA rising)
+- Price within 15% of 52-week high (fresh strength, not extended recovery)
+- 6-month return top quartile (relative momentum leader)
+- EPS growth >20% and revenue growth >15% (fundamental catalyst)
+- RVOL >1.5 on up days (institutional buying)
+- Industry/sector leadership (in leading sector per market context)
+Score NEAR ZERO for: downtrends, broken MA structure, China ADRs, negative earnings, lagging sectors.`,
 
-    compounder: `QUALITY COMPOUNDER RULES:
-- TECHNICALS (${w.tech}%): Technical setup confirms entry timing only. Not overbought (RSI<76). Not in downtrend. Near VWAP (not extended). 
-- FUNDAMENTALS (${w.fundamental}%): Durable moat required (network effects/switching costs/brand/patents). Positive FCF. Expanding margins. ROIC>WACC. Low debt. Score utilities (XLU) and REITs lower as they lack growth moats. Score 0-10 for commoditized businesses.
-- NEWS (${w.news}%): Use primarily as RED FLAG DETECTOR. Score VERY LOW for: guidance cuts, margin compression, key management departure, competitive threat news, regulatory issues. Score neutral (50) for no meaningful news. Score higher for moat-strengthening news (new patent, contract, partnership).
-- SECTOR (${w.sector}%): Favor sectors with durable long-term tailwinds (tech, healthcare, financials with moats). ${marketContext.summary}`,
+    compounder: `QUALITY COMPOUNDER — Buffett/Munger methodology. Score HIGHEST for:
+- Durable competitive moat (network effects, switching costs, brand, patents, cost advantage)
+- FCF positive and growing consistently
+- ROE >15%, margins expanding or stable
+- Low debt (D/E < 1.0 preferred)
+- Revenue growth >10% consistently
+- Reasonable valuation vs growth rate
+- Trading near VWAP (not overbought entry)
+Score NEAR ZERO for: commoditized businesses, shrinking margins, high debt, no moat.`,
 
-    catalyst: `CATALYST SWING RULES:
-- TECHNICALS (${w.tech}%): VWAP above is the PRIMARY gate — if below VWAP score 0-15 max. RSI 40-70 with building momentum. Fresh relative strength breakout. Crowd not yet fully positioned. PENALIZE: already extended 15%+ from VWAP, utilities (wrong sector for catalyst swing), downtrends.
-- FUNDAMENTALS (${w.fundamental}%): Only context for the 3-10 day hold. Positive business trajectory helps but is secondary. 
-- NEWS (${w.news}%): THIS IS THE MOST IMPORTANT DIMENSION FOR CATALYST SWING. Score VERY HIGH (80-95) for: confirmed earnings date within 10 days, FDA decision pending, confirmed product launch, stock split effective, analyst day, major contract announcement, index inclusion. Score HIGH (60-75) for: strong recent news flow showing momentum building, analyst upgrades, positive sector news. Score LOW (10-30) for: no meaningful news, general market mentions. UTILITIES SCORE 0-15 ON NEWS regardless of other factors — they are wrong strategy fit.
-- SECTOR (${w.sector}%): Strongly favor sectors with active catalysts and momentum. PENALIZE utilities (XLU), staples (XLP), REITs for catalyst swing — wrong profile entirely. ${marketContext.summary}`
+    catalyst: `CATALYST SWING — Smart money technical setup. Score HIGHEST for:
+- Price above VWAP (institutional net buyers — PRIMARY gate)
+- RSI 40-65 (room to move, not exhausted)
+- Bollinger Band squeeze (low bandwidth = compression before move)
+- RVOL spike (unusual institutional activity)
+- Price near 52-week high but consolidating (not extended)
+- Near-term dated catalyst within 10 days (earnings, FDA, launch, split)
+Score NEAR ZERO for: utilities, REITs, CEFs, below VWAP, RSI >75 (exhausted), downtrends.`
   };
 
   const tickerLines = batch.map(t => {
-    const d = t.data;
-    const news = t.news ? `News: "${t.news.substring(0, 150)}"` : 'News: none available';
-    return `${t.ticker}: VWAP${d.vwapAbove?'↑ABOVE':'↓BELOW'} DayMom${d.dayMomentum>0?'+':''}${d.dayMomentum}% RevGrowth${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'unknown'} MktCap${d.marketCap?'$'+Math.round(d.marketCap/1e9)+'B':'unknown'} | ${news}`;
+    const d = t.data; const ind = d.indicators;
+    const tt = d.trendTemplate;
+    return `${t.ticker}: TrendTemplate=${tt?.score||'?'}%(${tt?.passed||0}/10) MA50${ind?.ma50?'$'+ind.ma50.toFixed(0):'?'} MA200${ind?.ma200?'$'+ind.ma200.toFixed(0):'?'} RSI=${ind?.rsiVal||'?'} RVOL=${ind?.rvol||'?'} 52WHigh=${ind?.pctFromHigh||'?'}% 6mRet=${ind?.return6m||'?'}% BB=${ind?.bb?.bandwidth?.toFixed(1)||'?'}% RevGrow=${d.fin?.revenueGrowth||'?'}% EPSGrow=${d.fin?.earningsGrowth||'?'}% News=${t.news?'"'+t.news.substring(0,100)+'"':'none'}`;
   }).join('\n');
 
   const body = JSON.stringify({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 800,
-    system: `You are a stock screener. Apply these rules strictly:\n${stratRules[strategy]}\n\nCRITICAL: Every ticker in your response MUST have a UNIQUE score. Do not assign the same score to multiple tickers. Rank them precisely from best to worst fit for this strategy. Respond ONLY with a JSON object.`,
-    messages: [{
-      role: 'user',
-      content: `Score each ticker 0-100 for ${strategy} strategy. EVERY score must be unique — differentiate precisely based on the evidence. Utilities like WEC/ATO/DUK/AEE score 0-20 for catalyst strategy.\n\nTickers to score:\n${tickerLines}\n\nReturn JSON only with unique scores: {"TICK1": 87, "TICK2": 74, "TICK3": 61, ...} — NO duplicate values allowed.`
-    }]
+    system: `${stratRules[strategy]}\n\nMarket context: ${marketContext.summary}\n\nAssign unique scores 0-100. No two tickers same score. Differentiate precisely. JSON only.`,
+    messages: [{ role: 'user', content: `Score these tickers for ${strategy}. Every score must be UNIQUE:\n${tickerLines}\n\nReturn JSON: {"TICK1":87,"TICK2":74,...} — NO duplicates.` }]
   });
 
   const result = await fetchJson('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    headers: {
-      'x-api-key': ANTHROPIC_KEY,
-      'anthropic-version': '2023-06-01',
-      'content-type': 'application/json'
-    },
+    headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
     body
   });
 
   const text = result?.content?.find(b => b.type === 'text')?.text || '';
   try {
-    const clean = text.replace(/```json\n?/g,'').replace(/```/g,'').trim();
-    const start = clean.indexOf('{');
-    const end = clean.lastIndexOf('}');
-    return JSON.parse(clean.substring(start, end+1));
+    const start = text.indexOf('{'); const end = text.lastIndexOf('}');
+    return JSON.parse(text.substring(start, end + 1));
   } catch(e) { return {}; }
 }
 
 // ── MAIN ──
 async function main() {
-  console.log('[Scan] Starting PulseStock universe scan...');
-  console.log('[Scan] Sources: Polygon (price/VWAP/news/financials) + Haiku AI (strategy scoring)');
-
+  console.log('[Scan] PulseStock Universe Scanner v3.0 — Minervini/CAN SLIM Foundation');
   const universe = await fetchJson(TICKER_URL);
   const tickers = universe?.all || [];
-  console.log(`[Scan] ${tickers.length} tickers to scan`);
+  console.log(`[Scan] ${tickers.length} tickers`);
 
-  // Get market context FIRST — used in all Haiku scoring
   const marketContext = await getMarketContext();
-
   const today = new Date().toISOString().split('T')[0];
-  const strategies = ['momentum', 'compounder', 'catalyst'];
+  const yearAgo = new Date(Date.now() - 380*86400000).toISOString().split('T')[0]; // 380 days for 200 MA buffer
 
-  // Phase 1: Collect data for all tickers
-  console.log('\n[Scan] Phase 1: Collecting Polygon data...');
-  const allData = {};
-  let processed = 0;
+  // ── PHASE 1: Quick filter — just prev day data ──
+  console.log('\n[Phase 1] Quick filter: price, volume, VWAP...');
+  const phase1 = {};
+  let p1done = 0;
 
   for (const ticker of tickers) {
-    processed++;
+    p1done++;
+    const prev = await poly(`/v2/aggs/ticker/${ticker}/prev`);
+    const r = prev?.results?.[0];
+    if (!r || !r.c || !r.vw) continue;
 
-    const prev = await getPrevDay(ticker);
-    if (!prev || !prev.c || prev.c <= 0 || !prev.vw) {
-      if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`);
-      continue;
-    }
+    const dollarVol = (r.v * r.c) / 1e6; // millions
+    if (dollarVol < 5) continue;  // minimum $5M daily dollar volume
+    if (r.c < 2) continue;        // no sub-$2 stocks
+    if (!r.h || !r.l) continue;
+    const dayRange = (r.h - r.l) / r.l * 100;
+    if (dayRange < 0.3 || dayRange > 20) continue; // filter frozen or halted
 
-    // Quality filters
-    if (!prev.v || prev.v < 500000) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
-    if (!prev.h || !prev.l) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
-    const dayRangePct = (prev.h - prev.l) / prev.l * 100;
-    if (dayRangePct < 0.5 || dayRangePct > 25) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
-    const vwapDev = Math.abs(prev.c - prev.vw) / prev.vw * 100;
-    if (vwapDev > 20) { if (processed % 500 === 0) console.log(`[Scan] ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`); continue; }
+    phase1[ticker] = { price: r.c, vwap: r.vw, volume: r.v, dollarVol, open: r.o };
+    if (p1done % 200 === 0) console.log(`[Phase 1] ${p1done}/${tickers.length} — ${Object.keys(phase1).length} pass`);
+  }
+  console.log(`[Phase 1] Complete: ${Object.keys(phase1).length} pass quick filter`);
 
-    const vwapAbove = prev.c > prev.vw;
-    const dayMomentum = parseFloat(((prev.c - prev.o) / prev.o * 100).toFixed(2));
+  // ── PHASE 2: Fetch candle history + compute all indicators ──
+  console.log('\n[Phase 2] Fetching 200-day candles + computing indicators...');
+  const phase2 = {};
+  let p2done = 0;
+  const p1tickers = Object.keys(phase1);
 
-    // Get snapshot for 52W range position (critical for structure gate)
-    const snap = await getSnapshot(ticker);
-    const w52h = snap?.day?.h || snap?.prevDay?.h || null; // use day high as proxy
-    const todayHigh = snap?.day?.h || null;
-    const todayLow = snap?.day?.l || null;
-    
-    // Get 52W range from reference endpoint
-    const details = await getTickerDetails(ticker);
-    const marketCap = details?.market_cap || null;
-    const sharesFl = details?.share_class_shares_outstanding || null;
+  for (const ticker of p1tickers) {
+    p2done++;
+    const candles = await poly(`/v2/aggs/ticker/${ticker}/range/1/day/${yearAgo}/${today}?adjusted=true&sort=asc&limit=400`);
+    const bars = candles?.results || [];
 
-    // Compute 52W range position using Polygon aggregates (1 year)
-    const yearAgo = new Date(Date.now() - 365*86400000).toISOString().split('T')[0];
-    const today52 = new Date().toISOString().split('T')[0];
-    const aggs = await poly('/v2/aggs/ticker/'+ticker+'/range/1/day/'+yearAgo+'/'+today52+'?adjusted=true&sort=asc&limit=252');
-    let rangePos = null;
-    if (aggs?.results?.length > 10) {
-      const highs = aggs.results.map(r => r.h);
-      const lows = aggs.results.map(r => r.l);
-      const yearHigh = Math.max(...highs);
-      const yearLow = Math.min(...lows);
-      if (yearHigh > yearLow) {
-        rangePos = parseFloat(((prev.c - yearLow) / (yearHigh - yearLow) * 100).toFixed(1));
-      }
-    }
+    if (bars.length < 60) continue; // need at least 60 days
 
-    // Get financials for established companies
-    let revenueGrowth = null;
-    let marginTrend = null;
-    if (marketCap && marketCap > 5e7) {
-      const financials = await getFinancials(ticker);
-      if (financials && financials.length >= 2) {
-        const q1rev = financials[0]?.financials?.income_statement?.revenues?.value;
-        const q2rev = financials[1]?.financials?.income_statement?.revenues?.value;
-        if (q1rev && q2rev && q2rev > 0) revenueGrowth = parseFloat(((q1rev - q2rev) / q2rev).toFixed(3));
-        const q1ni = financials[0]?.financials?.income_statement?.net_income_loss?.value;
-        const q2ni = financials[1]?.financials?.income_statement?.net_income_loss?.value;
-        if (q1ni !== null && q2ni !== null) marginTrend = q1ni > q2ni ? 'expanding' : 'contracting';
-      }
-    }
+    const ind = computeAllIndicators(bars);
+    if (!ind) continue;
 
-    // Get news
-    const news = await getTickerNews(ticker);
+    // Fetch financials (for established companies)
+    const fin = phase1[ticker].dollarVol > 10 ? await getFinancials(ticker) : null;
 
-    allData[ticker] = {
-      price: prev.c, vwap: prev.vw, vwapAbove, dayMomentum,
-      volume: prev.v, marketCap, revenueGrowth, marginTrend, news,
-      rangePos, sharesFl
+    // Compute trend template score
+    const trendTemplate = trendTemplateScore(ind);
+
+    phase2[ticker] = {
+      ...phase1[ticker],
+      indicators: ind,
+      trendTemplate,
+      fin,
+      news: null // fetch in phase 3 only for finalists
     };
 
-    if (processed % 100 === 0) {
-      console.log(`[Scan] Phase 1: ${processed}/${tickers.length} — ${Object.keys(allData).length} valid`);
-    }
+    if (p2done % 50 === 0) console.log(`[Phase 2] ${p2done}/${p1tickers.length} — ${Object.keys(phase2).length} with indicators`);
   }
+  console.log(`[Phase 2] Complete: ${Object.keys(phase2).length} with full indicator data`);
 
-  console.log(`\n[Scan] Phase 1 complete: ${Object.keys(allData).length} tickers with valid data`);
+  // ── PHASE 3 & 4: Strategy-specific filters + AI scoring ──
+  const strategies = ['momentum', 'compounder', 'catalyst'];
 
-  // Phase 2 & 3: Filter + AI score per strategy
   for (const strategy of strategies) {
-    console.log(`\n[Scan] Processing ${strategy}...`);
+    console.log(`\n[${strategy.toUpperCase()}] Applying strategy filters...`);
 
-    const filtered = Object.keys(allData).filter(t => {
-      const d = allData[t];
-      // Apply SAME hard gates Sonnet uses — so 75%+ of candidates pass deep dive
+    // Strategy-specific hard gates — SAME criteria Sonnet uses to decline
+    const filtered = Object.keys(phase2).filter(t => {
+      const d = phase2[t];
+      const ind = d.indicators;
+      const tt = d.trendTemplate;
+      if (!ind) return false;
+
       if (strategy === 'momentum') {
-        if (!d.vwapAbove) return false;                    // must be above VWAP
-        if (d.volume < 1000000) return false;              // minimum volume
-        if (d.rangePos !== null && d.rangePos < 55) return false;  // must be in uptrend
+        // Minervini Trend Template — must pass at least 7 of 10 checks
+        if (!tt || tt.passed < 7) return false;
+        // Price within 25% of 52-week high
+        if (ind.pctFromHigh === null || ind.pctFromHigh < -25) return false;
+        // RSI must show strength
+        if (ind.rsiVal === null || ind.rsiVal < 50) return false;
+        // Dollar volume minimum $20M for liquidity
+        if (d.dollarVol < 20) return false;
         return true;
       }
+
       if (strategy === 'compounder') {
-        if (!d.marketCap || d.marketCap < 1e9) return false;  // $1B+ market cap
-        if (d.rangePos !== null && d.rangePos < 40) return false;  // not in deep downtrend
+        // Must be above key MAs for entry timing
+        if (!ind.ma50 || !ind.ma200 || ind.current < ind.ma200) return false;
+        // Not overbought
+        if (ind.rsiVal && ind.rsiVal > 78) return false;
+        // Meaningful size
+        if (d.dollarVol < 10) return false;
         return true;
       }
+
       if (strategy === 'catalyst') {
-        if (!d.vwapAbove) return false;                    // VWAP hard gate
-        if (d.volume < 500000) return false;               // minimum volume
-        if (d.rangePos !== null && (d.rangePos < 30 || d.rangePos > 85)) return false; // not at extremes
+        // VWAP is the hard gate — smart money must be in
+        if (!ind.vwapAbove) return false;
+        // RSI must have room to move
+        if (ind.rsiVal === null || ind.rsiVal < 35 || ind.rsiVal > 72) return false;
+        // Not near 52W lows (broken structure)
+        if (ind.rangePos !== null && ind.rangePos < 30) return false;
+        // Minimum liquidity
+        if (d.dollarVol < 5) return false;
         return true;
       }
-      return true;
+
+      return false;
     });
 
-    console.log(`[Scan] ${strategy}: ${filtered.length} pass mechanical filter`);
+    console.log(`[${strategy.toUpperCase()}] ${filtered.length} pass hard gates`);
 
-    // Haiku scoring in batches of 15 (smaller for better differentiation)
+    // Fetch news only for finalists
+    console.log(`[${strategy.toUpperCase()}] Fetching news for ${filtered.length} candidates...`);
+    for (const ticker of filtered) {
+      phase2[ticker].news = await getNews(ticker);
+    }
+
+    // Haiku AI scoring in batches of 12
     const aiScores = {};
     if (ANTHROPIC_KEY && filtered.length > 0) {
-      console.log(`[Scan] ${strategy}: AI scoring with market context + news...`);
-      const BATCH = 15;
+      const BATCH = 12;
       for (let i = 0; i < filtered.length; i += BATCH) {
-        const batch = filtered.slice(i, i+BATCH).map(t => ({
-          ticker: t,
-          data: allData[t],
-          news: allData[t].news
+        const batch = filtered.slice(i, i + BATCH).map(t => ({
+          ticker: t, data: phase2[t], news: phase2[t].news
         }));
         const scores = await haikuScore(batch, strategy, marketContext);
         Object.assign(aiScores, scores);
-        if (i % 150 === 0 && i > 0) console.log(`[Scan] ${strategy}: AI scored ${i}/${filtered.length}`);
-        await delay(200);
+        if (i % 60 === 0 && i > 0) console.log(`[${strategy.toUpperCase()}] AI scored ${i}/${filtered.length}`);
+        await delay(300);
       }
     }
 
-    // Rank by AI score (primary) + mechanical boost
+    // Rank: 70% AI score + 30% mechanical (trend template score)
     const ranked = filtered.map(t => {
-      const d = allData[t];
+      const d = phase2[t];
+      const ind = d.indicators;
+      const tt = d.trendTemplate;
       const aiScore = aiScores[t] || 0;
-      let mech = 0;
-      if (d.vwapAbove) mech += 20;
-      if (d.dayMomentum > 0) mech += 15;
-      if (d.revenueGrowth && d.revenueGrowth > 0) mech += 20;
-      if (d.marginTrend === 'expanding') mech += 10;
-      if (d.marketCap && d.marketCap > 1e9) mech += 10;
-      if (d.news) mech += 5; // has recent news
+      const mechScore = tt?.score || 0;
+      const combined = aiScore > 0 ? (aiScore * 0.70) + (mechScore * 0.30) : mechScore;
 
-      const combined = aiScore > 0 ? (mech * 0.25) + (aiScore * 0.75) : mech;
       return {
-        ticker: t, score: parseFloat(combined.toFixed(2)),
-        price: d.price, vwap: d.vwap, vwapAbove: d.vwapAbove,
-        revenueGrowth: d.revenueGrowth, marketCap: d.marketCap,
+        ticker: t,
+        score: parseFloat(combined.toFixed(2)),
+        price: d.price,
+        trendTemplateScore: tt?.score,
+        trendTemplatePassed: tt?.passed,
+        rsi: ind?.rsiVal,
+        return6m: ind?.return6m,
+        rvol: ind?.rvol,
+        bbWidth: ind?.bb?.bandwidth?.toFixed(1),
+        pctFromHigh: ind?.pctFromHigh,
+        revenueGrowth: d.fin?.revenueGrowth,
+        earningsGrowth: d.fin?.earningsGrowth,
         hasNews: !!d.news,
-        reason: `AI:${aiScore||'?'} VWAP${d.vwapAbove?'↑':'↓'} Mom${d.dayMomentum>0?'+':''}${d.dayMomentum}% Rev${d.revenueGrowth?(d.revenueGrowth*100).toFixed(0)+'%':'?'} News:${d.news?'yes':'no'}`
+        reason: `TT:${tt?.passed||0}/10(${tt?.score||0}%) RSI:${ind?.rsiVal||'?'} 6m:${ind?.return6m||'?'}% RVOL:${ind?.rvol||'?'} Hi:${ind?.pctFromHigh||'?'}% Rev:${d.fin?.revenueGrowth||'?'}% AI:${aiScore||'mech'}`
       };
-    }).sort((a,b) => b.score - a.score);
+    }).sort((a, b) => b.score - a.score);
 
-    // Apply minimum score cutoff — only genuinely high-conviction candidates
-    const MIN_SCORE = 65;
+    // Apply minimum score cutoff — only genuinely high conviction
+    const MIN_SCORE = 60;
     const qualified = ranked.filter(r => r.score >= MIN_SCORE);
-    console.log(`[Scan] ${strategy}: ${ranked.length} ranked, ${qualified.length} above ${MIN_SCORE} threshold — Top 5: ${(qualified.length ? qualified : ranked).slice(0,5).map(r=>r.ticker+'('+r.score+')').join(', ')}`);
+    const toSave = qualified.length >= 5 ? qualified : ranked.slice(0, 20);
 
-    // Use qualified list, fall back to top 50 if too few qualify
-    const toSave = qualified.length >= 10 ? qualified : ranked.slice(0, 50);
+    console.log(`[${strategy.toUpperCase()}] ${ranked.length} ranked, ${toSave.length} qualify (score >= ${MIN_SCORE})`);
+    console.log(`[${strategy.toUpperCase()}] Top 5: ${toSave.slice(0, 5).map(r => r.ticker + '(' + r.score + ')').join(', ')}`);
 
     // Save to Supabase
     await sb('DELETE', 'pre_screened_candidates', null, `?strategy_id=eq.${strategy}&trading_date=eq.${today}`);
     for (let i = 0; i < toSave.length; i++) {
       const c = toSave[i];
       await sb('POST', 'pre_screened_candidates', {
-        strategy_id: strategy, ticker: c.ticker, rank: i+1,
+        strategy_id: strategy, ticker: c.ticker, rank: i + 1,
         screen_score: c.score, screen_reason: c.reason,
-        price: c.price, trading_date: today
+        price: c.price, range_position: c.pctFromHigh,
+        rsi: c.rsi, trading_date: today
       });
-      if (i % 100 === 0 && i > 0) console.log(`[Scan] ${strategy}: saved ${i}/${ranked.length}`);
     }
-    console.log(`[Scan] ${strategy}: saved ${toSave.length} qualified candidates (score >= ${MIN_SCORE})`);
+    console.log(`[${strategy.toUpperCase()}] Saved ${toSave.length} candidates to Supabase`);
   }
 
   console.log('\n[Scan] Complete!');
