@@ -335,8 +335,8 @@ async function main() {
     if (!r || !r.c || !r.vw) continue;
 
     const dollarVol = (r.v * r.c) / 1e6; // millions
-    if (dollarVol < 5) continue;  // minimum $5M daily dollar volume
-    if (r.c < 2) continue;        // no sub-$2 stocks
+    if (dollarVol < 20) continue; // minimum $20M daily dollar volume — eliminates micro-caps
+    if (r.c < 5) continue;        // no sub-$5 stocks
     if (!r.h || !r.l) continue;
     const dayRange = (r.h - r.l) / r.l * 100;
     if (dayRange < 0.3 || dayRange > 20) continue; // filter frozen or halted
@@ -394,13 +394,17 @@ async function main() {
       if (!ind) return false;
 
       if (strategy === 'momentum') {
-        // Minervini Trend Template — must pass at least 7 of 10 checks
-        if (!tt || tt.passed < 7) return false;
-        // Price within 25% of 52-week high
+        // Minervini Trend Template — must pass at least 8 of 10 checks (strict)
+        if (!tt || tt.passed < 8) return false;
+        // Price within 25% of 52-week high (Minervini requirement)
         if (ind.pctFromHigh === null || ind.pctFromHigh < -25) return false;
-        // RSI must show strength
-        if (ind.rsiVal === null || ind.rsiVal < 50) return false;
-        // Dollar volume minimum $20M for liquidity
+        // Price at least 30% above 52-week low (Minervini requirement)
+        if (ind.pctAboveLow === null || ind.pctAboveLow < 30) return false;
+        // RSI must show strength — not weak
+        if (ind.rsiVal === null || ind.rsiVal < 52) return false;
+        // 6-month return must be positive — confirmed momentum
+        if (ind.return6m !== null && ind.return6m < 5) return false;
+        // Dollar volume minimum $20M
         if (d.dollarVol < 20) return false;
         return true;
       }
