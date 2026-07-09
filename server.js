@@ -5,7 +5,7 @@ const http = require('http');
 
 const SUPABASE_URL = 'https://ttcprqkoibiztibhpsrp.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0Y3BycWtvaWJpenRpYmhwc3JwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzNTk5NjcsImV4cCI6MjA5NTkzNTk2N30.kO-a0NYLQ0rrAV1V7Aj4O8Mwm7KFq2NPfIQl2uY5sDY';
-const FHK = 'd8fhh6hr01qn443a0bngd8fhh6hr01qn443a0bo0';
+const FHK = 'd95c889r01qihq3l33k0d95c889r01qihq3l33kg';
 const PORT = process.env.PORT || 8080;
 
 function fetchJson(url, opts = {}) {
