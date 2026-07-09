@@ -480,12 +480,40 @@ async function main() {
       };
     }).sort((a, b) => b.score - a.score);
 
-    // Apply minimum score cutoff — only genuinely high conviction
-    const MIN_SCORE = 60;
+    // Apply minimum score cutoff matching strategy confidence gates
+    const MIN_SCORES = { momentum: 75, compounder: 78, catalyst: 78 };
+    const MIN_SCORE = MIN_SCORES[strategy] || 75;
     const qualified = ranked.filter(r => r.score >= MIN_SCORE);
-    const toSave = qualified.length >= 5 ? qualified : ranked.slice(0, 20);
+    const toSave = qualified.length >= 5 ? qualified : ranked.slice(0, 15);
+    console.log(`[${strategy.toUpperCase()}] ${ranked.length} scored, ${toSave.length} above ${MIN_SCORE} threshold`);
 
     console.log(`[${strategy.toUpperCase()}] ${ranked.length} ranked, ${toSave.length} qualify (score >= ${MIN_SCORE})`);
+    // Re-rank top candidates together to break score ties
+    if (ANTHROPIC_KEY && toSave.length > 1) {
+      const top20 = toSave.slice(0, 20);
+      const reRankBody = JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 400,
+        system: 'You are ranking pre-screened stocks. Give each a UNIQUE score 0-100. No ties allowed. Respond JSON only.',
+        messages: [{ role: 'user', content: `Re-rank these ${strategy} candidates with unique scores. Every score must differ by at least 1 point:
+${top20.map(r => r.ticker+':'+r.score).join(',')}
+Return JSON: {"TICK1":95,"TICK2":91,...} — ALL unique.` }]
+      });
+      const reRankResult = await fetchJson('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: reRankBody
+      });
+      const reRankText = reRankResult?.content?.find(b => b.type === 'text')?.text || '';
+      try {
+        const start = reRankText.indexOf('{'); const end = reRankText.lastIndexOf('}');
+        const newScores = JSON.parse(reRankText.substring(start, end+1));
+        top20.forEach(r => { if (newScores[r.ticker]) r.score = parseFloat(newScores[r.ticker].toFixed(2)); });
+        top20.sort((a, b) => b.score - a.score);
+        // Update toSave with re-ranked top 20
+        toSave.splice(0, top20.length, ...top20);
+      } catch(e) {}
+    }
     console.log(`[${strategy.toUpperCase()}] Top 5: ${toSave.slice(0, 5).map(r => r.ticker + '(' + r.score + ')').join(', ')}`);
 
     // Save to Supabase
