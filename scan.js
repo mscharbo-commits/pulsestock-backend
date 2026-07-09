@@ -135,6 +135,11 @@ function computeIndicators(candles) {
 // Each component contributes a specific number of points — no AI, no clustering
 function scoreMomentum(ind, fin, news) {
   if (!ind || !ind.ma50 || !ind.ma200) return null;
+  
+  // Hard exclusions for Momentum Growth
+  if (ind.rsiVal && ind.rsiVal > 80) return null; // overbought/exhausted
+  if (fin && fin.revenueGrowth === 0 && fin.earningsGrowth <= 0) return null; // no revenue traction
+  
   let score = 0;
   const details = [];
 
@@ -211,12 +216,15 @@ function scoreMomentum(ind, fin, news) {
 
 function scoreCompounder(ind, fin, news) {
   if (!ind || !ind.ma200) return null;
+  
+  // Hard exclusions for Quality Compounder
+  if (ind.cur <= ind.ma200) return null; // must be above 200MA
+  if (ind.rsiVal && ind.rsiVal > 78) return null; // overbought
+  // Must show some revenue growth — pure utilities and no-growth companies excluded
+  if (fin && fin.revenueGrowth !== null && fin.revenueGrowth < 3 && fin.earningsGrowth < 5) return null;
+  
   let score = 0;
   const details = [];
-
-  // Must be above key MAs for entry timing
-  if (!ind.cur > ind.ma200) return null;
-  if (ind.rsiVal && ind.rsiVal > 78) return null; // overbought — wait
 
   // 1. QUALITY TECHNICAL SETUP (35 points)
   const checks = [
