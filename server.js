@@ -5,7 +5,8 @@ const http = require('http');
 
 const SUPABASE_URL = 'https://ttcprqkoibiztibhpsrp.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0Y3BycWtvaWJpenRpYmhwc3JwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzNTk5NjcsImV4cCI6MjA5NTkzNTk2N30.kO-a0NYLQ0rrAV1V7Aj4O8Mwm7KFq2NPfIQl2uY5sDY';
-const FHK = 'd95c889r01qihq3l33k0d95c889r01qihq3l33kg';
+const POLY_KEY = process.env.POLYGON_API_KEY || '2c90554e-b7d3-485f-a497-b350eb8136f5';
+const FHK = 'd95c889r01qihq3l33k0d95c889r01qihq3l33kg'; // kept for earnings calendar
 const PORT = process.env.PORT || 8080;
 
 function fetchJson(url, opts = {}) {
@@ -39,10 +40,17 @@ async function sb(method, table, data, params = '') {
 }
 
 async function getQuote(ticker) {
-  await new Promise(r => setTimeout(r, 150));
+  await new Promise(r => setTimeout(r, 50)); // Polygon has no aggressive rate limits
   try {
-    const d = await fetchJson(`https://finnhub.io/api/v1/quote?symbol=${ticker}&token=${FHK}`);
-    return d && d.c > 0 ? d : null;
+    // Use Polygon for prices — more reliable, no rate limit issues
+    const d = await fetchJson(`https://api.polygon.io/v2/aggs/ticker/${ticker}/prev`, {
+      headers: { 'Authorization': `Bearer ${POLY_KEY}` }
+    });
+    const r = d?.results?.[0];
+    if (r && r.c > 0) {
+      return { c: r.c, h: r.h, l: r.l, pc: r.o, v: r.v }; // map to Finnhub format
+    }
+    return null;
   } catch(e) { return null; }
 }
 
@@ -107,14 +115,30 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/prices') {
-    const tickers = (url.searchParams.get('tickers') || '').split(',').filter(Boolean).slice(0, 10);
-    const results = {};
-    for (const t of tickers) {
-      const q = await getQuote(t);
-      if (q) results[t] = { c: q.c, h: q.h, l: q.l, pc: q.pc };
+    const tickers = (url.searchParams.get('tickers') || '').split(',').filter(Boolean).slice(0, 20);
+    if (tickers.length === 1) {
+      // Single ticker — use snapshot for speed
+      const snap = await fetchJson(`https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/${tickers[0]}`, {
+        headers: { 'Authorization': `Bearer ${POLY_KEY}` }
+      });
+      const t = snap?.ticker;
+      const results = {};
+      if (t) {
+        const price = t.day?.c || t.prevDay?.c || t.lastTrade?.p;
+        results[tickers[0]] = { c: price, h: t.day?.h, l: t.day?.l, pc: t.prevDay?.c, vw: t.day?.vw };
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify(results));
+    } else {
+      // Multiple tickers — use prev day aggregates
+      const results = {};
+      for (const ticker of tickers) {
+        const q = await getQuote(ticker);
+        if (q) results[ticker] = { c: q.c, h: q.h, l: q.l, pc: q.pc };
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify(results));
     }
-    res.writeHead(200);
-    res.end(JSON.stringify(results));
     return;
   }
 
