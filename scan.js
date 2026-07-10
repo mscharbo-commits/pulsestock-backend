@@ -138,7 +138,6 @@ function scoreMomentum(ind, fin, news) {
   
   // Hard exclusions for Momentum Growth
   if (ind.rsiVal && ind.rsiVal > 80) return null; // overbought/exhausted
-  if (fin && fin.revenueGrowth === 0 && fin.earningsGrowth <= 0) return null; // no revenue traction
   
   let score = 0;
   const details = [];
@@ -220,8 +219,6 @@ function scoreCompounder(ind, fin, news) {
   // Hard exclusions for Quality Compounder
   if (ind.cur <= ind.ma200) return null; // must be above 200MA
   if (ind.rsiVal && ind.rsiVal > 78) return null; // overbought
-  // Must show some revenue growth — pure utilities and no-growth companies excluded
-  if (fin && fin.revenueGrowth !== null && fin.revenueGrowth < 3 && fin.earningsGrowth < 5) return null;
   
   let score = 0;
   const details = [];
@@ -409,10 +406,29 @@ async function main() {
     const ind = computeIndicators(bars);
     if (!ind) continue;
 
-    // Fetch financials for stocks with enough history
-    const fin = bars.length >= 200 ? await getFinancials(ticker) : null;
+    // Fetch ticker details for market cap and SIC/sector classification
+    let details = null;
+    let sic = null;
+    let mktCap = null;
+    if (bars.length >= 50) {
+      await delay(80);
+      const det = await poly(`/v3/reference/tickers/${ticker}`);
+      if (det?.results) {
+        sic = det.results.sic_code ? parseInt(det.results.sic_code) : null;
+        mktCap = det.results.market_cap || null;
+        details = { sic, mktCap,
+          // SIC codes for exclusions:
+          // 2830-2836 = Pharma/Biotech (pre-revenue risk)
+          // 4900-4999 = Utilities (no growth)
+          // 6000-6999 = Banks/Finance (different analysis)
+          isBiotech: sic && sic >= 2830 && sic <= 2836,
+          isUtility: sic && sic >= 4900 && sic <= 4999,
+          isSmallCap: mktCap && mktCap < 1e9 // below $1B
+        };
+      }
+    }
 
-    phase2[ticker] = { ...phase1[ticker], indicators: ind, fin, news: null };
+    phase2[ticker] = { ...phase1[ticker], indicators: ind, fin: null, details, news: null };
     if (p2done % 100 === 0) console.log(`[Phase 2] ${p2done}/${Object.keys(phase1).length} — ${Object.keys(phase2).length} with indicators`);
   }
   console.log(`[Phase 2] Complete: ${Object.keys(phase2).length} with full indicators`);
@@ -428,6 +444,17 @@ async function main() {
     for (const ticker of Object.keys(phase2)) {
       const d = phase2[ticker];
       const ind = d.indicators;
+      const det = d.details || {};
+
+      // Sector-based hard exclusions
+      if (strategy === 'momentum') {
+        if (det.isBiotech) continue; // pre-revenue biotech risk
+        if (det.isUtility) continue; // no growth
+        if (det.isSmallCap) continue; // need institutional support
+      }
+      if (strategy === 'compounder') {
+        if (det.isUtility) continue; // utilities are not compounders
+      }
 
       let result = null;
       if (strategy === 'momentum') result = scoreMomentum(ind, d.fin, d.news);
