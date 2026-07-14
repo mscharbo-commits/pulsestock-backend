@@ -1,5 +1,6 @@
 // PulseStock Research Backend — Railway always-on server
-// Lightweight server — scan runs as separate Railway cron job
+// Morning routine runs at 8am ET: scan + auto-generate picks
+require('./morning-routine');
 const https = require('https');
 const http = require('http');
 
