@@ -127,7 +127,8 @@ async function autoGeneratePicks(today) {
     const rulesData = await fetch(`${SUPABASE_URL}/rest/v1/rules?strategy_id=eq.${strat}&is_active=eq.true&order=created_at.desc&limit=20`, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
     });
-    const rules = (rulesData || []).map(r => r.rule_text).join(' | ');
+    const rulesArr = Array.isArray(rulesData) ? rulesData : (rulesData?.data || []);
+    const rules = rulesArr.map(r => r.rule_text).filter(Boolean).join(' | ');
 
     // Get held positions
     const heldData = await fetch(`${SUPABASE_URL}/rest/v1/study_picks?strategy_id=eq.${strat}&status=eq.open&select=ticker`, {
