@@ -124,7 +124,7 @@ async function autoGeneratePicks(today) {
     });
     const gen = genData?.[0]?.gen_number || 1;
 
-    const rulesData = await fetch(`${SUPABASE_URL}/rest/v1/rules?strategy_id=eq.${strat}&is_active=eq.true&order=created_at.desc&limit=20`, {
+    const rulesData = await fetch(`${SUPABASE_URL}/rest/v1/rules?strategy_id=eq.${strat}&active=eq.true&order=created_at.desc&limit=20`, {
       headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }
     });
     const rulesArr = Array.isArray(rulesData) ? rulesData : (rulesData?.data || []);
