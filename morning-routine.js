@@ -14,19 +14,25 @@ const SUPABASE_URL = 'https://ttcprqkoibiztibhpsrp.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0Y3BycWtvaWJpenRpYmhwc3JwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzNTk5NjcsImV4cCI6MjA5NTkzNTk2N30.kO-a0NYLQ0rrAV1V7Aj4O8Mwm7KFq2NPfIQl2uY5sDY';
 const TICKER_URL = 'https://raw.githubusercontent.com/mscharbo-commits/pulsestock-study-data/main/ticker_universe.json';
 
-function fetch(url, opts = {}) {
+function fetchJson(url, opts = {}) {
   return new Promise((resolve) => {
     const mod = url.startsWith('https') ? https : require('http');
-    const req = mod.request(url, { method: opts.method || 'GET', headers: opts.headers || {} }, (res) => {
+    const reqOpts = {
+      method: opts.method || 'GET',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': 'PulseStock/1.0', ...(opts.headers || {}) }
+    };
+    const req = mod.request(url, reqOpts, (res) => {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve(null); } });
     });
-    req.on('error', () => resolve(null));
-    if (opts.body) req.write(opts.body);
+    req.on('error', (e) => { console.error('[fetch]', url, e.message); resolve(null); });
+    req.setTimeout(15000, () => { req.destroy(); resolve(null); });
+    if (opts.body) req.write(typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body));
     req.end();
   });
 }
+const fetch = fetchJson;
 
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
